@@ -1,0 +1,28 @@
+services:
+  ollama-cloud-proxy:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: ollama-cloud-proxy
+    restart: unless-stopped
+    command: ["python", "/proxy/ollama_cloud_proxy.py"]
+    environment:
+      CLOUD_MODELS: "gemma4:31b-cloud,nemotron-3-super:cloud"
+    volumes:
+      - ./work/ollama_cloud_proxy.py:/proxy/ollama_cloud_proxy.py:ro
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "3000:8080"
+    environment:
+      OLLAMA_BASE_URL: "http://ollama-cloud-proxy:11434"
+      WEBUI_NAME: "Open WebUI"
+      OFFLINE_MODE: "true"
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      RAG_RERANKING_MODEL_AUTO_UPDATE: "false"
+    volumes:
+      - open-webui:/app/backend/data
+
+volumes:
+  open-webui:
