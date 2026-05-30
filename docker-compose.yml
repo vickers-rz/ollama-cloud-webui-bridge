@@ -6,6 +6,8 @@ services:
     command: ["python", "/proxy/ollama_cloud_proxy.py"]
     environment:
       CLOUD_MODELS: "gemma4:31b-cloud,nemotron-3-super:cloud"
+      CHROME_AI_MODEL: "chrome-gemini-nano"
+      CHROME_AI_UPSTREAM: "http://host.docker.internal:8766"
     volumes:
       - ./work/ollama_cloud_proxy.py:/proxy/ollama_cloud_proxy.py:ro
 

@@ -50,23 +50,32 @@ Ollama Cloud models can be usable without appearing in /api/tags.
 ```
 
 This project adds a tiny bridge container between Open WebUI and the host Ollama service.
+It can also route one browser-managed Chrome Built-in AI model into Open WebUI.
 
 ## Architecture
 
 ```text
 Open WebUI container
   -> http://ollama-cloud-proxy:11434
-      -> http://host.docker.internal:11434
-          -> macOS Ollama
-              -> Ollama Cloud
+      -> Ollama cloud models
+          -> http://host.docker.internal:11434
+              -> macOS Ollama
+                  -> Ollama Cloud
+      -> chrome-gemini-nano
+          -> http://host.docker.internal:8766
+              -> Chrome AI bridge on macOS
+                  -> Chrome LanguageModel API
+                      -> Chrome-managed Gemini Nano model
 ```
 
 The proxy does only two special things:
 
-1. `GET /api/tags` and `GET /v1/models` return a configured list of cloud model names.
-2. Everything else is forwarded unchanged to the real host Ollama API.
+1. `GET /api/tags` and `GET /v1/models` return configured Ollama Cloud model names plus `chrome-gemini-nano`.
+2. Requests for Ollama Cloud models are forwarded unchanged to the real host Ollama API.
+3. Requests for `chrome-gemini-nano` are routed to the Chrome AI bridge.
 
 That means model discovery is patched for Open WebUI, while actual chat and generation still go through the normal local Ollama service.
+For `chrome-gemini-nano`, actual chat goes through a Chrome tab that calls the browser's Built-in AI API.
 
 ## Included Models
 
@@ -75,11 +84,14 @@ The current compose file exposes:
 ```text
 gemma4:31b-cloud
 nemotron-3-super:cloud
+chrome-gemini-nano
 ```
 
 `gemma4:31b-cloud` is useful as the default general model.
 
 `nemotron-3-super:cloud` is useful for harder reasoning, planning, coding, and agent-style workflows.
+
+`chrome-gemini-nano` is the Chrome-managed on-device Gemini Nano model. It is useful for lightweight local tasks when Chrome's `LanguageModel` API is available.
 
 ## Quick Start
 
@@ -95,6 +107,20 @@ Start:
 ```bash
 docker compose up -d
 ```
+
+Start the Chrome AI bridge on macOS if you want to use `chrome-gemini-nano`:
+
+```bash
+python3 work/chrome_ai_bridge.py
+```
+
+Then open this URL in Chrome and keep the tab open:
+
+```text
+http://127.0.0.1:8766/
+```
+
+The worker page polls the local bridge for tasks, calls `LanguageModel.create()` in Chrome, and returns the response to Open WebUI.
 
 Open:
 
@@ -138,6 +164,20 @@ Check what Open WebUI sees:
 docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/tags
 ```
 
+Check the Chrome AI bridge from macOS:
+
+```bash
+curl -s http://127.0.0.1:8766/health
+```
+
+Check the Chrome model through the Docker bridge:
+
+```bash
+docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"chrome-gemini-nano","stream":false,"messages":[{"role":"user","content":"Reply with exactly: bridge OK"}]}'
+```
+
 Check host Ollama from inside Open WebUI:
 
 ```bash
@@ -150,7 +190,15 @@ This is not an Ollama replacement and not a model server.
 
 It is a compatibility shim for Open WebUI model discovery. It exists because the cloud models are callable by name through Ollama but may not be listed by Ollama's local model inventory endpoint.
 
-No passwords, Ollama account tokens, or Open WebUI credentials are stored in this project.
+No passwords, Ollama account tokens, Open WebUI credentials, or Chrome profile data are stored in this project.
+
+The Chrome AI path is intentionally minimal:
+
+- non-streaming chat only
+- one local Chrome worker tab should stay open
+- no direct access to `weights.bin`
+- no browser cookies, history, bookmarks, passwords, or profile stores are read
+- if Chrome closes or the worker tab is closed, `chrome-gemini-nano` requests will time out
 
 ## Project Name
 
