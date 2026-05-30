@@ -1,30 +1,16 @@
 services:
   ollama-cloud-proxy:
-    image: ghcr.io/open-webui/open-webui:main
+    # #8 改用本地构建的轻量镜像（~60 MB），替代 open-webui 大镜像（~1.5 GB）
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    image: ollama-cloud-proxy:local
     container_name: ollama-cloud-proxy
     restart: unless-stopped
-    command: ["python", "/proxy/ollama_cloud_proxy.py"]
     environment:
       CLOUD_MODELS: "gemma4:31b-cloud,nemotron-3-super:cloud"
       CHROME_AI_MODEL: "chrome-gemini-nano"
       CHROME_AI_UPSTREAM: "http://host.docker.internal:8766"
     volumes:
+      # 挂载源文件方便开发期热修改，生产可去掉此行
       - ./work/ollama_cloud_proxy.py:/proxy/ollama_cloud_proxy.py:ro
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    environment:
-      OLLAMA_BASE_URL: "http://ollama-cloud-proxy:11434"
-      WEBUI_NAME: "Open WebUI"
-      OFFLINE_MODE: "true"
-      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
-      RAG_RERANKING_MODEL_AUTO_UPDATE: "false"
-    volumes:
-      - open-webui:/app/backend/data
-
-volumes:
-  open-webui:

@@ -1,10 +1,21 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 
+# ── 日志 ──────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [proxy] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger("proxy")
+
+# ── 配置 ──────────────────────────────────────────────────────────────────────
 UPSTREAM = os.environ.get("OLLAMA_UPSTREAM", "http://host.docker.internal:11434")
 CHROME_AI_UPSTREAM = os.environ.get(
     "CHROME_AI_UPSTREAM",
@@ -21,6 +32,28 @@ MODEL_IDS = [
 ]
 ALL_MODEL_IDS = MODEL_IDS + [CHROME_AI_MODEL]
 
+# 启动时间，用于 modified_at 字段
+_STARTED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+log.info("upstream=%s cloud_models=%s chrome_model=%s", UPSTREAM, MODEL_IDS, CHROME_AI_MODEL)
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+def fetch_upstream_models():
+    """从上游 Ollama 获取真实模型列表，失败时返回空列表。"""
+    try:
+        req = urllib.request.Request(
+            f"{UPSTREAM}/api/tags",
+            method="GET",
+            headers={"Accept": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("models", [])
+    except Exception as exc:
+        log.warning("fetch_upstream_models failed: %s", exc)
+        return []
+
 
 def model_payload(model_id):
     family = model_id.split(":", 1)[0]
@@ -30,7 +63,7 @@ def model_payload(model_id):
     return {
         "name": model_id,
         "model": model_id,
-        "modified_at": "2026-05-30T00:00:00Z",
+        "modified_at": _STARTED_AT,   # #10 动态生成，不再硬编码日期
         "size": size,
         "digest": model_format,
         "details": {
@@ -44,6 +77,11 @@ def model_payload(model_id):
     }
 
 
+def _502_body(exc):
+    return json.dumps({"error": f"upstream unavailable: {exc}"}).encode("utf-8")
+
+
+# ── 请求处理器 ────────────────────────────────────────────────────────────────
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -83,6 +121,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        except urllib.error.URLError as exc:          # #3 新增：网络/连接异常
+            log.error("_proxy %s %s -> URLError: %s", self.command, self.path, exc)
+            body = _502_body(exc)
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def _post_json(self, url, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -92,8 +138,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             method="POST",
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            return resp.status, resp.headers, resp.read()
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.URLError as exc:          # #3 新增
+            log.error("_post_json %s -> URLError: %s", url, exc)
+            raise
 
     def _read_json(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -103,10 +153,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _proxy_chrome_ai_openai_chat(self, payload):
         payload["model"] = CHROME_AI_MODEL
-        status, headers, data = self._post_json(
-            f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
-            payload,
-        )
+        try:
+            status, headers, data = self._post_json(
+                f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
+                payload,
+            )
+        except urllib.error.URLError as exc:
+            self._send_json({"error": f"chrome_ai_upstream unavailable: {exc}"}, status=502)
+            return
         self.send_response(status)
         for key, value in headers.items():
             if key.lower() not in {"transfer-encoding", "connection"}:
@@ -124,10 +178,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         }
         if "options" in payload:
             openai_payload["options"] = payload["options"]
-        status, _headers, data = self._post_json(
-            f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
-            openai_payload,
-        )
+        try:
+            status, _headers, data = self._post_json(
+                f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
+                openai_payload,
+            )
+        except urllib.error.URLError as exc:
+            self._send_json({"error": f"chrome_ai_upstream unavailable: {exc}"}, status=502)
+            return
         if status >= 400:
             self.send_response(status)
             self.send_header("Content-Length", str(len(data)))
@@ -139,7 +197,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "model": CHROME_AI_MODEL,
-                "created_at": result.get("created_at", "2026-05-30T00:00:00Z"),
+                "created_at": result.get("created_at", _STARTED_AT),
                 "message": {"role": "assistant", "content": content},
                 "done": True,
             }
@@ -152,10 +210,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
         }
-        status, _headers, data = self._post_json(
-            f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
-            openai_payload,
-        )
+        try:
+            status, _headers, data = self._post_json(
+                f"{CHROME_AI_UPSTREAM}/v1/chat/completions",
+                openai_payload,
+            )
+        except urllib.error.URLError as exc:
+            self._send_json({"error": f"chrome_ai_upstream unavailable: {exc}"}, status=502)
+            return
         if status >= 400:
             self.send_response(status)
             self.send_header("Content-Length", str(len(data)))
@@ -167,7 +229,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self._send_json(
             {
                 "model": CHROME_AI_MODEL,
-                "created_at": result.get("created_at", "2026-05-30T00:00:00Z"),
+                "created_at": result.get("created_at", _STARTED_AT),
                 "response": content,
                 "done": True,
             }
@@ -175,7 +237,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in {"/api/tags", "/api/ps"}:
-            self._send_json({"models": [model_payload(model_id) for model_id in ALL_MODEL_IDS]})
+            virtual_models = [model_payload(model_id) for model_id in ALL_MODEL_IDS]
+            virtual_names = {m["name"] for m in virtual_models}
+            upstream_models = [
+                m for m in fetch_upstream_models()
+                if m.get("name") not in virtual_names
+            ]
+            all_models = virtual_models + upstream_models
+            log.info("GET %s -> %d models", self.path, len(all_models))
+            self._send_json({"models": all_models})
             return
         if self.path == "/v1/models":
             self._send_json(
@@ -215,6 +285,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if payload.get("model") == CHROME_AI_MODEL:
                 self._proxy_chrome_ai_ollama_chat(payload)
                 return
+            log.info("POST /api/chat model=%s -> upstream", payload.get("model"))
             self._proxy_payload(payload)
             return
         if self.path == "/api/generate":
@@ -222,6 +293,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if payload.get("model") == CHROME_AI_MODEL:
                 self._proxy_chrome_ai_ollama_generate(payload)
                 return
+            log.info("POST /api/generate model=%s -> upstream", payload.get("model"))
             self._proxy_payload(payload)
             return
         self._proxy()
@@ -250,13 +322,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+        except urllib.error.URLError as exc:          # #3 新增
+            log.error("_proxy_payload %s -> URLError: %s", self.path, exc)
+            body = _502_body(exc)
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def do_DELETE(self):
         self._proxy()
 
     def log_message(self, fmt, *args):
-        return
+        # 已由 logging 模块接管，屏蔽 BaseHTTPRequestHandler 的默认输出
+        pass
 
 
 if __name__ == "__main__":
+    log.info("ollama-cloud-proxy listening on 0.0.0.0:11434")
     ThreadingHTTPServer(("0.0.0.0", 11434), ProxyHandler).serve_forever()

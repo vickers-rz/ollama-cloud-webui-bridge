@@ -1,6 +1,6 @@
 # Ollama Cloud WebUI Bridge
 
-Expose Ollama Cloud models to Open WebUI when Ollama can run the model but does not list it in `/api/tags`.
+Expose Ollama Cloud models, Chrome Built-in AI, and local Ollama models to Open WebUI through a single lightweight proxy container.
 
 ## Why This Exists
 
@@ -9,89 +9,49 @@ Ollama's own desktop chat UI can use cloud models such as:
 - `gemma4:31b-cloud`
 - `nemotron-3-super:cloud`
 
-On this machine, the local Ollama service was healthy and reachable:
+Open WebUI depends on `/api/tags` for model discovery, but Ollama Cloud models do not appear in that endpoint's response. This project adds a tiny proxy container that:
 
-```text
-Ollama 0.24.0
-Listening on 0.0.0.0:11434
-Expose Ollama to network: enabled
-```
-
-Open WebUI was deployed in OrbStack and configured to reach the host Ollama service. The obvious configuration was:
-
-```text
-OLLAMA_BASE_URL=http://host.docker.internal:11434
-```
-
-That verified correctly from inside the Open WebUI container:
-
-```text
-GET http://host.docker.internal:11434/api/version -> {"version":"0.24.0"}
-```
-
-But Open WebUI still showed no Ollama models, because Ollama's discovery endpoint returned an empty list:
-
-```json
-{"models":[]}
-```
-
-At the same time, Ollama itself could identify cloud models directly:
-
-```text
-ollama show gemma4:31b-cloud
-ollama show nemotron-3-super:cloud
-```
-
-So the problem was not that Ollama Cloud was unusable. The problem was narrower:
-
-```text
-Open WebUI depends on /api/tags for Ollama model discovery.
-Ollama Cloud models can be usable without appearing in /api/tags.
-```
-
-This project adds a tiny bridge container between Open WebUI and the host Ollama service.
-It can also route one browser-managed Chrome Built-in AI model into Open WebUI.
+1. Returns virtual entries for cloud models and `chrome-gemini-nano` in `/api/tags`
+2. Fetches the real local model list from the upstream Ollama and merges it (so local models like `qwen3.5:4b` also appear automatically)
+3. Forwards chat/generate requests for cloud models to the real host Ollama
+4. Routes `chrome-gemini-nano` requests to a local Chrome AI bridge
 
 ## Architecture
 
 ```text
 Open WebUI container
-  -> http://ollama-cloud-proxy:11434
-      -> Ollama cloud models
-          -> http://host.docker.internal:11434
-              -> macOS Ollama
-                  -> Ollama Cloud
-      -> chrome-gemini-nano
-          -> http://host.docker.internal:8766
-              -> Chrome AI bridge on macOS
-                  -> Chrome LanguageModel API
-                      -> Chrome-managed Gemini Nano model
+  → http://ollama-cloud-proxy:11434  (Docker-internal)
+      ├── GET /api/tags
+      │     virtual cloud models  +  chrome-gemini-nano
+      │     + real local models fetched live from host Ollama
+      │
+      ├── cloud model requests (gemma4:31b-cloud, nemotron-3-super:cloud …)
+      │     → http://host.docker.internal:11434
+      │           → macOS Ollama → Ollama Cloud
+      │
+      ├── local model requests (qwen3.5:4b, llama3 …)
+      │     → http://host.docker.internal:11434
+      │           → macOS Ollama (local GGUF inference)
+      │
+      └── chrome-gemini-nano requests
+            → http://host.docker.internal:8766
+                  → Chrome AI bridge on macOS
+                        → Chrome LanguageModel API
+                              → Chrome-managed Gemini Nano model
 ```
-
-The proxy does only two special things:
-
-1. `GET /api/tags` and `GET /v1/models` return configured Ollama Cloud model names plus `chrome-gemini-nano`.
-2. Requests for Ollama Cloud models are forwarded unchanged to the real host Ollama API.
-3. Requests for `chrome-gemini-nano` are routed to the Chrome AI bridge.
-
-That means model discovery is patched for Open WebUI, while actual chat and generation still go through the normal local Ollama service.
-For `chrome-gemini-nano`, actual chat goes through a Chrome tab that calls the browser's Built-in AI API.
 
 ## Included Models
 
-The current compose file exposes:
+The proxy surfaces:
 
-```text
-gemma4:31b-cloud
-nemotron-3-super:cloud
-chrome-gemini-nano
-```
+| Model | Type | Source |
+|---|---|---|
+| `gemma4:31b-cloud` | Cloud | Ollama Cloud via host Ollama |
+| `nemotron-3-super:cloud` | Cloud | Ollama Cloud via host Ollama |
+| `chrome-gemini-nano` | On-device | Chrome LanguageModel API |
+| *(any local model)* | Local | Host Ollama — auto-discovered |
 
-`gemma4:31b-cloud` is useful as the default general model.
-
-`nemotron-3-super:cloud` is useful for harder reasoning, planning, coding, and agent-style workflows.
-
-`chrome-gemini-nano` is the Chrome-managed on-device Gemini Nano model. It is useful for lightweight local tasks when Chrome's `LanguageModel` API is available.
+Local models (pulled with `ollama pull`) appear in Open WebUI automatically on every refresh. No configuration change required.
 
 ## Quick Start
 
@@ -102,13 +62,25 @@ Prerequisites:
 - Ollama's "Expose Ollama to network" enabled
 - A working Ollama Cloud sign-in in the Ollama app
 
-Start:
+Open WebUI must be on the same Docker network as the proxy. The
+[orbstack-open-webui compose](../Codex/2026-05-30/orbstack-open-webui/docker-compose.yml)
+declares `ollama-cloud-webui-bridge_default` as an external network.
+
+Start the proxy:
 
 ```bash
+cd /Users/vickers/Documents/ollama-cloud-webui-bridge
 docker compose up -d
 ```
 
-Start the Chrome AI bridge on macOS if you want to use `chrome-gemini-nano`:
+Start Open WebUI (separate compose project):
+
+```bash
+cd /Users/vickers/Documents/Codex/2026-05-30/orbstack-open-webui
+docker compose up -d
+```
+
+Start the Chrome AI bridge on macOS if you want `chrome-gemini-nano`:
 
 ```bash
 python3 work/chrome_ai_bridge.py
@@ -120,124 +92,94 @@ Then open this URL in Chrome and keep the tab open:
 http://127.0.0.1:8766/
 ```
 
-The worker page polls the local bridge for tasks, calls `LanguageModel.create()` in Chrome, and returns the response to Open WebUI.
-
-Open:
+Open WebUI:
 
 ```text
 http://localhost:3000
 ```
 
-Open WebUI should discover the configured cloud models through:
-
-```text
-http://ollama-cloud-proxy:11434
-```
-
-That hostname is Docker-internal. It is not meant to be opened in the macOS browser.
-
 ## Daily Use Runbook
-
-To use `chrome-gemini-nano` in Open WebUI, keep these three layers running:
-
-```text
-OrbStack / Docker
-  open-webui + ollama-cloud-proxy
-
-macOS host
-  python3 work/chrome_ai_bridge.py
-
-Chrome
-  http://127.0.0.1:8766/
-```
 
 Recommended startup order:
 
-1. Start OrbStack.
-
-   If the containers were not stopped manually, Docker should restart them because the compose file uses `restart: unless-stopped`.
-
-   Check:
+1. **Start OrbStack** — `restart: unless-stopped` means containers resume automatically.
 
    ```bash
-   docker ps
+   docker ps   # confirm open-webui and ollama-cloud-proxy are up
    ```
 
-   Expected containers:
+2. **Start the Chrome AI bridge** (only needed for `chrome-gemini-nano`):
 
-   ```text
-   open-webui
-   ollama-cloud-proxy
-   ```
-
-2. Start the Chrome AI bridge on macOS.
-
-   Foreground mode:
-
+   Foreground:
    ```bash
-   cd /Users/vickers/Documents/ollama-cloud-webui-bridge
    python3 work/chrome_ai_bridge.py
    ```
 
-   Background mode:
-
+   Background:
    ```bash
-   cd /Users/vickers/Documents/ollama-cloud-webui-bridge
    nohup python3 work/chrome_ai_bridge.py > /tmp/chrome_ai_bridge.log 2>&1 &
    ```
 
-3. Open the Chrome worker page and keep it open:
+3. **Open the Chrome worker page** and keep it open:
 
    ```text
    http://127.0.0.1:8766/
    ```
 
-   This tab is the part that actually calls Chrome's `LanguageModel` API. If the tab is closed, Open WebUI requests to `chrome-gemini-nano` will time out.
-
-4. Open Open WebUI:
+4. **Open Open WebUI**:
 
    ```text
    http://localhost:3000
    ```
 
-   Select:
+## Emergency Bypass: Proxy Down
 
-   ```text
-   chrome-gemini-nano
-   ```
+If `ollama-cloud-proxy` is stopped or broken and you need Open WebUI to work
+with local Ollama models only, bypass the proxy by pointing Open WebUI directly
+at the host Ollama.
 
-Readiness check:
-
-```bash
-curl -s http://127.0.0.1:8766/health
-```
-
-Ready output should include:
-
-```json
-{"ok": true, "model": "chrome-gemini-nano", "worker_connected": true}
-```
-
-If `worker_connected` is `false`, the Python bridge is running but the Chrome worker tab is not connected. Open `http://127.0.0.1:8766/` in Chrome.
-
-If Open WebUI cannot see `chrome-gemini-nano`, check the Docker-side proxy:
+**Step 1 — Edit the Open WebUI compose file:**
 
 ```bash
-docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/tags
+# file: /Users/vickers/Documents/Codex/2026-05-30/orbstack-open-webui/docker-compose.yml
 ```
 
-If Open WebUI sees the model but chat times out, check:
+Change:
+
+```yaml
+OLLAMA_BASE_URL: "http://ollama-cloud-proxy:11434"
+```
+
+To:
+
+```yaml
+OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+```
+
+And add under the service:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+```
+
+**Step 2 — Recreate the container:**
 
 ```bash
-curl -s http://127.0.0.1:8766/health
-tail -n 80 /tmp/chrome_ai_bridge.log
+cd /Users/vickers/Documents/Codex/2026-05-30/orbstack-open-webui
+docker compose up -d --force-recreate
 ```
 
-The most common missing pieces are:
+**Step 3 — Restore when proxy is back:**
 
-- OrbStack is not running, so Open WebUI is unavailable.
-- `python3 work/chrome_ai_bridge.py` is not running, so Docker cannot reach `host.docker.internal:8766`.
-- The Chrome worker tab is closed, so the bridge has no browser context to call `LanguageModel`.
+Revert the two changes above and recreate again:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+> Note: In bypass mode, cloud models (`gemma4:31b-cloud`, `nemotron-3-super:cloud`,
+> `chrome-gemini-nano`) will not appear. Only models pulled via `ollama pull` are visible.
 
 ## Add More Cloud Models
 
@@ -247,11 +189,21 @@ Edit `docker-compose.yml`:
 CLOUD_MODELS: "gemma4:31b-cloud,nemotron-3-super:cloud,qwen3.5:cloud"
 ```
 
-Then recreate:
+Recreate:
 
 ```bash
 docker compose up -d --force-recreate
 ```
+
+## Add More Local Models
+
+Local Ollama models are discovered automatically. Just pull:
+
+```bash
+ollama pull llama3.2
+```
+
+Refresh Open WebUI — the model appears immediately, no config change needed.
 
 ## Verify
 
@@ -261,37 +213,62 @@ Check containers:
 docker compose ps
 ```
 
-Check what Open WebUI sees:
+Check what Open WebUI sees through the proxy:
 
 ```bash
-docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/tags
+docker exec open-webui python3 -c "
+import urllib.request, json
+d = json.loads(urllib.request.urlopen('http://ollama-cloud-proxy:11434/api/tags', timeout=5).read())
+for m in d['models']: print(m['name'], m['details']['format'])
+"
 ```
 
-Check the Chrome AI bridge from macOS:
+Check the Chrome AI bridge:
 
 ```bash
 curl -s http://127.0.0.1:8766/health
 ```
 
-Check the Chrome model through the Docker bridge:
+Ready output:
 
-```bash
-docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/chat \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"chrome-gemini-nano","stream":false,"messages":[{"role":"user","content":"Reply with exactly: bridge OK"}]}'
+```json
+{
+  "ok": true,
+  "model": "chrome-gemini-nano",
+  "worker_connected": true,
+  "queue_depth": 0,
+  "pending_tasks": 0,
+  "uptime_seconds": 42
+}
 ```
 
-Check host Ollama from inside Open WebUI:
+If `worker_connected` is `false`, open `http://127.0.0.1:8766/` in Chrome.
+
+Check proxy logs:
 
 ```bash
-docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/version
+docker logs ollama-cloud-proxy --tail 30
+```
+
+Test Chrome model end-to-end:
+
+```bash
+docker exec open-webui python3 -c "
+import urllib.request, json
+req = urllib.request.Request(
+    'http://ollama-cloud-proxy:11434/api/chat',
+    data=json.dumps({'model':'chrome-gemini-nano','stream':False,
+                     'messages':[{'role':'user','content':'Reply: bridge OK'}]}).encode(),
+    headers={'Content-Type':'application/json'}, method='POST')
+print(json.loads(urllib.request.urlopen(req, timeout=30).read()))
+"
 ```
 
 ## Notes
 
 This is not an Ollama replacement and not a model server.
 
-It is a compatibility shim for Open WebUI model discovery. It exists because the cloud models are callable by name through Ollama but may not be listed by Ollama's local model inventory endpoint.
+It is a compatibility shim for Open WebUI model discovery. Cloud models are callable by name through Ollama but do not appear in `/api/tags` — this proxy patches that gap while also surfacing real local models automatically.
 
 No passwords, Ollama account tokens, Open WebUI credentials, or Chrome profile data are stored in this project.
 

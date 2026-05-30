@@ -1,0 +1,9 @@
+# #8 用 python:3.12-slim 替代 open-webui 大镜像（节省 ~1.4 GB）
+FROM python:3.12-slim
+
+WORKDIR /proxy
+COPY work/ollama_cloud_proxy.py .
+
+# proxy 只需要 Python 标准库，无需额外依赖
+EXPOSE 11434
+CMD ["python", "ollama_cloud_proxy.py"]

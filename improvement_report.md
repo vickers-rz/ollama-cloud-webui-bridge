@@ -2,107 +2,68 @@
 
 ## 总览
 
-这个项目整体设计简洁、目标明确，是一个将 Ollama Cloud 模型暴露给 Open WebUI 的代理桥接层。核心功能运作良好，但在**可靠性、安全性、可观测性**和**功能完整性**上有明显的改进空间。
+这个项目整体设计简洁、目标明确，是一个将 Ollama Cloud 模型暴露给 Open WebUI 的代理桥接层。
+
+**状态说明：**
+- ✅ 已实现
+- ⏳ 待实现
 
 ---
 
-## 🔴 优先级高 — 可靠性问题
+## 🔴 优先级高 — 可靠性
 
-### 1. 忙等循环占满线程（`chrome_ai_bridge.py` L221–252）
+### 1. ✅ 忙等循环占满线程（`chrome_ai_bridge.py`）
 
-**问题：** 主线程在等待 Chrome worker 返回结果时，用 `time.sleep(0.1)` 轮询，每个请求会在一个线程里占用最多 `TASK_TIMEOUT_SECONDS`（默认 180 秒）。  
-`ThreadingHTTPServer` 每个连接一个线程，高并发下会耗尽线程资源。
+~~`time.sleep(0.1)` 轮询，高并发下耗尽线程。~~
 
-```python
-# 现在：忙等
-while time.time() < deadline:
-    result = results.pop(task_id, None)
-    if result:
-        ...
-    time.sleep(0.1)
-```
-
-**建议：** 用 `threading.Event` 代替轮询。
+**已修复：** 改用 `threading.Event`，线程在 `event.wait(timeout=...)` 上阻塞，不占 CPU。
 
 ```python
-# 改进后
-pending: dict[str, threading.Event] = {}
-results: dict[str, dict] = {}
-
-# 提交任务时
+# 当前实现（_wait_result）
 event = threading.Event()
-pending[task_id] = event
-tasks.put({"id": task_id, "prompt": ...})
+with _state_lock:
+    _pending[task_id] = event
 fired = event.wait(timeout=TASK_TIMEOUT_SECONDS)
-
-# worker 返回结果时
-results[payload["id"]] = payload
-ev = pending.pop(payload["id"], None)
-if ev:
-    ev.set()
 ```
 
-### 2. `results` 字典无限增长
+---
 
-**问题：** `results` 是进程级全局字典，任务结果写入后永不清理（即使超时也不删）。长时间运行会泄漏内存。
+### 2. ✅ `results` 字典内存泄漏
 
-**建议：** 在超时路径中也 `pop` 对应的 key，并在 worker 写入时使用 `pending` event 机制（见上条）。
+~~超时任务的结果永不清理，长时间运行会 OOM。~~
 
-```python
-# 超时路径需补充清理
-results.pop(task_id, None)
-pending.pop(task_id, None)
-self._send({"error": "timeout"}, status=504)
-```
+**已修复：** `_wait_result()` 在成功和超时两条路径都执行 `_results.pop(task_id, None)` 和 `_pending.pop(task_id, None)`，保证状态不泄漏。
 
-### 3. `_proxy` 不处理网络连接异常
+---
 
-**问题：** `_proxy()` 只捕获了 `urllib.error.HTTPError`，但 `urllib.error.URLError`（连接拒绝/DNS 失败/超时）会向上抛出，导致 500 或连接直接断开，Open WebUI 会看到无意义的错误。
+### 3. ✅ `_proxy` 不处理网络连接异常
 
-```python
-# 现在只处理 HTTP 错误
-except urllib.error.HTTPError as err:
-    ...
-# URLError / timeout 未处理 ↑
-```
+~~`_proxy()` 只捕获 `HTTPError`，`URLError`（连接拒绝/DNS/超时）会 crash。~~
 
-**建议：**
+**已修复：** `_proxy()`、`_proxy_payload()`、`_post_json()` 全部补上 `except urllib.error.URLError`，返回 502 而非崩溃。
 
 ```python
-except urllib.error.HTTPError as err:
-    data = err.read()
-    self._send_json({"error": str(err)}, status=err.code)
-except urllib.error.URLError as err:
-    self._send_json({"error": f"Upstream unreachable: {err.reason}"}, status=502)
-except TimeoutError:
-    self._send_json({"error": "Upstream timeout"}, status=504)
+except urllib.error.URLError as exc:
+    log.error("_proxy %s -> URLError: %s", self.path, exc)
+    self._send_json({"error": f"upstream unavailable: {exc}"}, status=502)
 ```
 
 ---
 
 ## 🟠 优先级中 — 功能缺失
 
-### 4. 不支持流式输出（Streaming）
+### 4. ⏳ 不支持流式输出（Streaming）
 
-**问题：** `chrome_ai_bridge.py` 直接拒绝 streaming 请求（`status=400`），`ollama_cloud_proxy.py` 在代理 Ollama Cloud 时会把整个响应体缓冲再一次性返回，没有 chunked 转发。
+**现状：** `chrome_ai_bridge.py` 直接拒绝 streaming（返回 400）；`ollama_cloud_proxy.py` 全量缓冲再返回，Open WebUI 没有打字机效果。
 
-这意味着：
-- Open WebUI 对 `chrome-gemini-nano` 没有打字机效果
-- 极长响应时浏览器会长时间白屏
-
-**建议（chrome_ai_bridge 侧）：**  
-利用 Chrome `LanguageModel` 的 `promptStreaming()` API 逐块返回 SSE 事件，配合 `Transfer-Encoding: chunked`。
-
-**建议（ollama_cloud_proxy 侧）：**  
-对 Ollama Cloud 的流式响应应流式转发，避免缓冲：
+**待做：**
+- proxy 侧：改用 chunked 转发，去掉 `data = resp.read()` 全量缓冲
+- chrome 侧：接入 `LanguageModel.promptStreaming()`，转换为 SSE 或 Ollama NDJSON 格式
 
 ```python
-# 替换 _proxy/_proxy_payload 中的 data = resp.read()
+# proxy 流式转发示意
 with urllib.request.urlopen(req, timeout=600) as resp:
     self.send_response(resp.status)
-    for key, value in resp.headers.items():
-        if key.lower() not in {"transfer-encoding", "connection", "content-length"}:
-            self.send_header(key, value)
     self.send_header("Transfer-Encoding", "chunked")
     self.end_headers()
     while chunk := resp.read(4096):
@@ -112,74 +73,70 @@ with urllib.request.urlopen(req, timeout=600) as resp:
     self.wfile.write(b"0\r\n\r\n")
 ```
 
-### 5. `modified_at` 日期硬编码
+---
 
-**问题：** `model_payload()` 里 `"modified_at": "2026-05-30T00:00:00Z"` 是硬编码。
+### 5. ✅ `modified_at` 日期硬编码
 
-**建议：** 用启动时间或 `datetime.utcnow().isoformat() + "Z"` 动态生成。
+~~`model_payload()` 里写死了 `"2026-05-30T00:00:00Z"`。~~
+
+**已修复：** 改为进程启动时动态生成：
 
 ```python
-from datetime import datetime, timezone
-
-_STARTUP_TIME = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-def model_payload(model_id):
-    ...
-    "modified_at": _STARTUP_TIME,
+_STARTED_AT = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 ```
 
-### 6. Chrome worker 轮询用 GET 传结果不安全
+---
 
-**问题：** 结果通过 GET query string 传回（`/worker/result?id=...&content=...`），大响应可能超出 URL 长度限制（浏览器通常限制 2000–8000 字节）。
+### 6. ✅ Chrome worker 用 GET 传结果，URL 长度受限
 
-**建议：** 改为 POST JSON：
+~~`/worker/result?id=...&content=...` 大响应会超出 URL 长度限制（2000–8000 字节）。~~
+
+**已修复：** JS worker 改为 POST JSON 回传：
 
 ```javascript
-// worker 侧
-await fetch("/worker/result", {
-  method: "POST",
-  headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({id: task.id, content}),
-});
+await postJson("/worker/result", {id: task.id, content});
 ```
+
+服务端 `POST /worker/result` 接收并调用 `_put_result()` 触发 Event。旧 GET 路径保留兼容但打印 warning。
 
 ---
 
 ## 🟡 优先级中低 — 可观测性
 
-### 7. 日志完全静默
+### 7. ✅ 日志完全静默
 
-**问题：** 两个文件都重写了 `log_message` 直接 `return`，完全没有任何日志。出错时只能靠 `curl` 手动排查。
+~~两个文件都把 `log_message` 覆盖为空。~~
 
-**建议：** 改用 `logging` 模块，只记录关键事件：
+**已修复：** 两个文件均接入 `logging` 模块：
 
 ```python
-import logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s [proxy] %(levelname)s %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
-
-def log_message(self, fmt, *args):
-    logger.info("%s %s", self.path, fmt % args)
+log = logging.getLogger("proxy")
 ```
 
-### 8. `/health` 端点信息不够丰富
+关键路径（启动参数、模型列表请求、chat 请求分发、上游错误）均有记录。
 
-**问题：** 当前 `/health` 只返回 `worker_connected`，不区分"Python 进程正常但 Chrome tab 未连接"和"任务队列堆积"。
+---
 
-**建议：**
+### 8. ✅ `/health` 端点信息单薄
 
-```python
+~~只返回 `worker_connected`，无法区分队列堆积和 Chrome 断连。~~
+
+**已修复：** 现在返回：
+
+```json
 {
-    "ok": True,
-    "model": MODEL_ID,
-    "worker_connected": ...,
-    "queue_depth": tasks.qsize(),
-    "pending_tasks": len(pending),
-    "uptime_seconds": int(time.time() - START_TIME),
+  "ok": true,
+  "model": "chrome-gemini-nano",
+  "worker_connected": true,
+  "worker_last_seen_seconds_ago": 2.1,
+  "queue_depth": 0,
+  "pending_tasks": 0,
+  "uptime_seconds": 120
 }
 ```
 
@@ -187,69 +144,70 @@ def log_message(self, fmt, *args):
 
 ## 🔵 优先级低 — 代码质量
 
-### 9. `docker-compose.yml` 两个服务用同一镜像
+### 9. ✅ proxy 容器使用 open-webui 大镜像（~1.5 GB）
 
-**问题：**
+~~proxy 只运行一个 Python 脚本，却拉 open-webui 全量镜像。~~
 
-```yaml
-ollama-cloud-proxy:
-  image: ghcr.io/open-webui/open-webui:main   # ← open-webui 的 1.5GB+ 镜像
-```
-
-proxy 本身只是一个 Python HTTP 服务器，用 `open-webui` 镜像运行是因为镜像里有 Python，但这意味着每次启动都要拉取一个巨大的镜像，且 proxy 只用到了其中的 `python` 可执行文件。
-
-**建议：** 给 proxy 写一个单独的轻量 Dockerfile：
+**已修复：** 新增 `Dockerfile.proxy`，改用 `python:3.12-slim`（~60 MB）：
 
 ```dockerfile
 FROM python:3.12-slim
-COPY work/ollama_cloud_proxy.py /proxy/ollama_cloud_proxy.py
-CMD ["python", "/proxy/ollama_cloud_proxy.py"]
+WORKDIR /proxy
+COPY work/ollama_cloud_proxy.py .
+EXPOSE 11434
+CMD ["python", "ollama_cloud_proxy.py"]
 ```
 
-这样镜像从 ~1.5 GB 降到 ~60 MB，启动更快，攻击面也更小。
+`docker-compose.yml` 改为本地 build，镜像名 `ollama-cloud-proxy:local`。
 
-### 10. `chrome_ai_bridge.py` 中 `messages_to_prompt` 丢失 system prompt
+---
 
-**问题：** 当前实现把所有消息拼成 `role: content` 字符串发给 Chrome `LanguageModel.prompt()`，这样 `system` 角色消息会作为普通文本插入，行为不符合预期。
+### 10. ⏳ `chrome_ai_bridge.py` 中 system prompt 处理不当
 
-**建议：** 利用 `LanguageModel.create({ systemPrompt })` 和 `session.prompt()` 的分离：
+**现状：** `messages_to_prompt()` 把 `system` 角色消息当普通文本拼入 prompt，未利用 `LanguageModel.create({ systemPrompt })` 的独立传参。
+
+**待做：**
 
 ```javascript
 async function runMessages(messages) {
   const system = messages.find(m => m.role === "system");
-  const userMessages = messages.filter(m => m.role !== "system");
+  const rest = messages.filter(m => m.role !== "system");
   const session = await LanguageModel.create({
     systemPrompt: system?.content ?? "",
   });
   try {
-    const prompt = userMessages.map(m => `${m.role}: ${m.content}`).join("\n") + "\nassistant:";
-    return await session.prompt(prompt);
+    return await session.prompt(
+      rest.map(m => `${m.role}: ${m.content}`).join("\n") + "\nassistant:"
+    );
   } finally {
     session.destroy?.();
   }
 }
 ```
 
-### 11. 缺少 `requirements.txt` / `pyproject.toml`
+---
 
-**问题：** `chrome_ai_bridge.py` 只用标准库，但没有任何 Python 环境声明。未来添加依赖时容易出问题。
+### 11. ⏳ 缺少 Python 版本声明
 
-**建议：** 添加一个 `pyproject.toml`（或至少 `requirements.txt`）声明 Python 版本要求（`>=3.11`，需要 `walrus operator` 和 `match`）。
+**现状：** 无 `pyproject.toml` 或 `requirements.txt`，未来添加依赖时可能出问题。
+
+**待做：** 添加 `pyproject.toml` 声明 `requires-python = ">=3.11"`（walrus operator `chunk := ...` 需要 3.8+，type hint `dict[str, ...]` 需要 3.9+）。
 
 ---
 
 ## 改进优先级汇总
 
-| # | 问题 | 优先级 | 影响 |
+| # | 问题 | 优先级 | 状态 |
 |---|------|--------|------|
-| 1 | 忙等轮询耗尽线程 | 🔴 高 | 高并发崩溃 |
-| 2 | results 字典内存泄漏 | 🔴 高 | 长期运行 OOM |
-| 3 | URLError 未捕获 | 🔴 高 | 上游不可用时 crash |
-| 4 | 不支持流式输出 | 🟠 中 | 用户体验差 |
-| 5 | modified_at 硬编码 | 🟠 中 | 轻微 |
-| 6 | GET 传大结果可能截断 | 🟠 中 | 长回复时丢数据 |
-| 7 | 完全无日志 | 🟡 中低 | 排障困难 |
-| 8 | /health 信息单薄 | 🟡 中低 | 运维体验 |
-| 9 | proxy 用 open-webui 镜像 | 🔵 低 | 镜像太大 |
-| 10 | system prompt 处理错误 | 🔵 低 | 模型理解偏差 |
-| 11 | 缺少 Python 版本声明 | 🔵 低 | 可维护性 |
+| 1 | 忙等轮询耗尽线程 | 🔴 高 | ✅ 已完成 |
+| 2 | results 字典内存泄漏 | 🔴 高 | ✅ 已完成 |
+| 3 | URLError 未捕获导致 crash | 🔴 高 | ✅ 已完成 |
+| 4 | 不支持流式输出 | 🟠 中 | ⏳ 待实现 |
+| 5 | modified_at 硬编码 | 🟠 中 | ✅ 已完成 |
+| 6 | GET 传大结果可能截断 | 🟠 中 | ✅ 已完成 |
+| 7 | 完全无日志 | 🟡 中低 | ✅ 已完成 |
+| 8 | /health 信息单薄 | 🟡 中低 | ✅ 已完成 |
+| 9 | proxy 用 open-webui 大镜像 | 🔵 低 | ✅ 已完成 |
+| 10 | system prompt 处理不当 | 🔵 低 | ⏳ 待实现 |
+| 11 | 缺少 Python 版本声明 | 🔵 低 | ⏳ 待实现 |
+| — | 本地模型自动合并（新增） | — | ✅ 已完成 |
