@@ -136,6 +136,109 @@ http://ollama-cloud-proxy:11434
 
 That hostname is Docker-internal. It is not meant to be opened in the macOS browser.
 
+## Daily Use Runbook
+
+To use `chrome-gemini-nano` in Open WebUI, keep these three layers running:
+
+```text
+OrbStack / Docker
+  open-webui + ollama-cloud-proxy
+
+macOS host
+  python3 work/chrome_ai_bridge.py
+
+Chrome
+  http://127.0.0.1:8766/
+```
+
+Recommended startup order:
+
+1. Start OrbStack.
+
+   If the containers were not stopped manually, Docker should restart them because the compose file uses `restart: unless-stopped`.
+
+   Check:
+
+   ```bash
+   docker ps
+   ```
+
+   Expected containers:
+
+   ```text
+   open-webui
+   ollama-cloud-proxy
+   ```
+
+2. Start the Chrome AI bridge on macOS.
+
+   Foreground mode:
+
+   ```bash
+   cd /Users/vickers/Documents/ollama-cloud-webui-bridge
+   python3 work/chrome_ai_bridge.py
+   ```
+
+   Background mode:
+
+   ```bash
+   cd /Users/vickers/Documents/ollama-cloud-webui-bridge
+   nohup python3 work/chrome_ai_bridge.py > /tmp/chrome_ai_bridge.log 2>&1 &
+   ```
+
+3. Open the Chrome worker page and keep it open:
+
+   ```text
+   http://127.0.0.1:8766/
+   ```
+
+   This tab is the part that actually calls Chrome's `LanguageModel` API. If the tab is closed, Open WebUI requests to `chrome-gemini-nano` will time out.
+
+4. Open Open WebUI:
+
+   ```text
+   http://localhost:3000
+   ```
+
+   Select:
+
+   ```text
+   chrome-gemini-nano
+   ```
+
+Readiness check:
+
+```bash
+curl -s http://127.0.0.1:8766/health
+```
+
+Ready output should include:
+
+```json
+{"ok": true, "model": "chrome-gemini-nano", "worker_connected": true}
+```
+
+If `worker_connected` is `false`, the Python bridge is running but the Chrome worker tab is not connected. Open `http://127.0.0.1:8766/` in Chrome.
+
+If Open WebUI cannot see `chrome-gemini-nano`, check the Docker-side proxy:
+
+```bash
+docker exec open-webui curl -s http://ollama-cloud-proxy:11434/api/tags
+```
+
+If Open WebUI sees the model but chat times out, check:
+
+```bash
+curl -s http://127.0.0.1:8766/health
+tail -n 80 /tmp/chrome_ai_bridge.log
+```
+
+The most common missing pieces are:
+
+- OrbStack is not running, so Open WebUI is unavailable.
+- `python3 work/chrome_ai_bridge.py` is not running, so Docker cannot reach `host.docker.internal:8766`.
+- The Chrome worker tab is closed, so the bridge has no browser context to call `LanguageModel`.
+
 ## Add More Cloud Models
 
 Edit `docker-compose.yml`:
